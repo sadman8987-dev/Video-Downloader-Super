@@ -20,7 +20,11 @@ class DownloadError(Exception):
 
 
 class PrivateVideoError(DownloadError):
-    """المحتوى خاص أو يتطلب تسجيل دخول."""
+    """المحتوى خاص فعلاً أو يتطلب صلاحية وصول."""
+
+
+class PlatformVerificationRequired(DownloadError):
+    """المنصة تطلب تحققاً بشرياً أو تسجيل دخول لمكافحة البوتات."""
 
 
 class DownloadTimeoutError(DownloadError):
@@ -96,16 +100,26 @@ async def _run_ytdlp(url: str, folder: Path, mode: str) -> Path:
     if process.returncode != 0:
         message = stderr.decode("utf-8", errors="replace")
         logger.warning("yt-dlp failed: %s", message[-1800:])
+        lowered = message.lower()
+        if any(marker in lowered for marker in (
+            "sign in to confirm", "confirm you're not a bot",
+            "confirm you’re not a bot", "verify you are human",
+            "captcha", "automated requests",
+        )):
+            raise PlatformVerificationRequired(
+                "المنصة طلبت تحققاً لمكافحة البوتات؛ لم يتم اعتبار الرابط خاصاً."
+            )
         if _looks_private(message):
             raise PrivateVideoError("المحتوى غير متاح للعامة")
-        if any(s in message.lower() for s in ("timed out", "timeout", "temporary failure")):
+        if any(s in lowered for s in ("timed out", "timeout", "temporary failure")):
             raise DownloadTimeoutError("انتهت مهلة الاتصال")
         raise DownloadError("فشل التنزيل")
 
     extensions = {".mp3"} if mode == "audio" else {".mp4", ".mkv", ".webm", ".mov"}
     result = _find_file(folder, extensions)
-    if result.stat().st_size > MAX_UPLOAD_BYTES:
-        raise FileTooLargeError("الملف أكبر من حد الإرسال المسموح")
+    # الصوت لا يمكن إرساله إذا تجاوز الحد؛ الفيديو يمر إلى مرحلة الضغط أدناه.
+    if mode == "audio" and result.stat().st_size > MAX_UPLOAD_BYTES:
+        raise FileTooLargeError("ملف الصوت أكبر من حد الإرسال المسموح")
     return result
 
 
