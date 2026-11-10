@@ -16,7 +16,7 @@ from telegram.ext import (
 
 from downloader import (
     DownloadError, DownloadTimeoutError, FileTooLargeError,
-    PrivateVideoError, download_video, download_audio,
+    PrivateVideoError, PlatformVerificationRequired, download_video, download_audio,
 )
 
 logging.basicConfig(
@@ -186,10 +186,15 @@ async def choose_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                             pool_timeout=30,
                         )
         await status.delete()
+    except PlatformVerificationRequired:
+        await status.edit_text(
+            "⚠️ المنصة طلبت تحققاً لمكافحة التنزيل الآلي (مثل YouTube). "
+            "هذا لا يعني أن الفيديو خاص. جرّب لاحقاً أو استخدم رابطاً عاماً آخر."
+        )
     except PrivateVideoError:
         await status.edit_text(
-            "🔒 تعذر الوصول إلى المحتوى. قد يكون خاصاً أو محذوفاً أو يتطلب تسجيل دخول. "
-            "لا يحاول البوت تجاوز إعدادات الخصوصية."
+            "🔒 المنصة أكدت أن المحتوى خاص أو يتطلب صلاحية وصول. "
+            "استخدم رابطاً عاماً تملك حق الوصول إليه."
         )
     except DownloadTimeoutError:
         await status.edit_text("⏰ استغرق التنزيل وقتاً أطول من المسموح. حاول لاحقاً.")
