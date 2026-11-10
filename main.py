@@ -1,4 +1,4 @@
-"""بوت تيليجرام لتنزيل المحتوى المسموح به فقط."""
+"""بوت تيليجرام لتنزيل الفيديو والصوت MP3 للمحتوى المسموح به فقط."""
 import asyncio
 import logging
 import os
@@ -6,14 +6,17 @@ import time
 from collections import defaultdict, deque
 from urllib.parse import urlparse
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.error import TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes, MessageHandler,
+    CallbackQueryHandler, filters,
+)
 
 from downloader import (
     DownloadError, DownloadTimeoutError, FileTooLargeError,
-    PrivateVideoError, download_video,
+    PrivateVideoError, download_video, download_audio,
 )
 
 logging.basicConfig(
@@ -82,10 +85,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text("⛔ عذراً، غير مسموح لك باستخدام هذا البوت.")
         return
     await msg.reply_text(
-        "أهلاً بك في بوت تنزيل الفيديو 📥\n\n"
-        "أرسل رابطاً عاماً من YouTube أو TikTok أو Instagram أو Facebook أو X.\n"
+        "أهلاً بك في بوت تنزيل الوسائط 📥\n\n"
+        "أرسل رابطاً عاماً من YouTube أو TikTok أو Instagram أو Facebook أو X، "
+        "ثم اختر تنزيل فيديو أو صوت MP3.\n"
         "يُسمح فقط بالمحتوى الذي تملك حق تنزيله أو لديك إذن باستخدامه.\n\n"
-        "استخدم /help لمعرفة طريقة الاستخدام."
+        "استخدم /help لمعرفة التفاصيل."
     )
 
 
@@ -98,11 +102,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     await msg.reply_text(
         "طريقة الاستخدام:\n"
-        "1) أرسل رابط فيديو عام من منصة مدعومة.\n"
-        "2) انتظر انتهاء التجهيز.\n"
-        "3) سيُرسل الفيديو في نفس المحادثة.\n\n"
-        "الحد: 5 طلبات لكل دقيقة، وتنزيلان في الوقت نفسه.\n"
-        "لا يدعم البوت الحسابات الخاصة أو تجاوز تسجيل الدخول أو القيود."
+        "1) أرسل رابطاً عاماً من منصة مدعومة.\n"
+        "2) اختر 🎬 تنزيل فيديو أو 🎵 تنزيل صوت MP3.\n"
+        "3) انتظر إرسال الملف.\n\n"
+        "الحد: 5 طلبات لكل دقيقة، وتنزيلان في الوقت نفسه. "
+        "لا يدعم البوت المحتوى الخاص أو تجاوز تسجيل الدخول أو القيود."
     )
 
 
@@ -122,41 +126,82 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await msg.reply_text("❌ الرابط غير صحيح أو المنصة غير مدعومة.")
         return
 
-    status = await msg.reply_text("⏳ جاري فحص الرابط وتجهيز الفيديو...")
+    context.user_data["pending_media_url"] = url
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎬 تنزيل فيديو", callback_data="media:video"),
+        InlineKeyboardButton("🎵 تنزيل صوت MP3", callback_data="media:audio"),
+    ]])
+    await msg.reply_text("اختار نوع الملف المطلوب:", reply_markup=keyboard)
+
+
+async def choose_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+    if not authorized(query.from_user.id):
+        await query.answer("⛔ غير مسموح لك باستخدام هذا البوت.", show_alert=True)
+        return
+
+    url = context.user_data.get("pending_media_url")
+    if not url:
+        await query.answer("انتهت صلاحية الرابط. أرسله مرة أخرى.", show_alert=True)
+        return
+
+    mode = (query.data or "").split(":", 1)[1]
+    if mode not in {"video", "audio"}:
+        await query.answer("اختيار غير صالح.", show_alert=True)
+        return
+    await query.answer("بدأ تجهيز الملف...")
+    context.user_data.pop("pending_media_url", None)
+
+    status = await query.message.reply_text(
+        "⏳ جاري تجهيز الصوت MP3..." if mode == "audio" else "⏳ جاري تجهيز الفيديو..."
+    )
     try:
-        # يسمح بتنزيلين وإرسالهما في الوقت نفسه كحد أقصى.
         async with DOWNLOAD_SEMAPHORE:
-            async with download_video(url) as video_path:
-                await context.bot.send_chat_action(
-                    chat_id=msg.chat_id, action=ChatAction.UPLOAD_VIDEO
-                )
-                await status.edit_text("✅ اكتمل التنزيل، جاري إرسال الفيديو...")
-                with video_path.open("rb") as stream:
-                    await msg.reply_video(
-                        video=stream,
-                        supports_streaming=True,
-                        read_timeout=180,
-                        write_timeout=180,
-                        connect_timeout=30,
-                        pool_timeout=30,
-                    )
+            manager = download_audio(url) if mode == "audio" else download_video(url)
+            async with manager as media_path:
+                action = ChatAction.UPLOAD_AUDIO if mode == "audio" else ChatAction.UPLOAD_VIDEO
+                await context.bot.send_chat_action(chat_id=query.message.chat_id, action=action)
+                await status.edit_text("✅ اكتمل التنزيل، جاري إرسال الملف...")
+                with media_path.open("rb") as stream:
+                    if mode == "audio":
+                        await query.message.reply_audio(
+                            audio=stream,
+                            filename=media_path.name,
+                            title=media_path.stem[:64],
+                            caption="🎵 تم تنزيل الصوت بصيغة MP3 — 192 kbps",
+                            read_timeout=180,
+                            write_timeout=180,
+                            connect_timeout=30,
+                            pool_timeout=30,
+                        )
+                    else:
+                        await query.message.reply_video(
+                            video=stream,
+                            supports_streaming=True,
+                            read_timeout=180,
+                            write_timeout=180,
+                            connect_timeout=30,
+                            pool_timeout=30,
+                        )
         await status.delete()
     except PrivateVideoError:
         await status.edit_text(
-            "🔒 تعذر الوصول إلى الفيديو. قد يكون خاصاً أو محذوفاً أو يتطلب تسجيل دخول.\n"
+            "🔒 تعذر الوصول إلى المحتوى. قد يكون خاصاً أو محذوفاً أو يتطلب تسجيل دخول. "
             "لا يحاول البوت تجاوز إعدادات الخصوصية."
         )
     except DownloadTimeoutError:
         await status.edit_text("⏰ استغرق التنزيل وقتاً أطول من المسموح. حاول لاحقاً.")
     except FileTooLargeError:
-        await status.edit_text("❌ حجم الفيديو أكبر من حد تيليجرام حتى بعد الضغط.")
+        await status.edit_text("❌ حجم الملف أكبر من حد تيليجرام حتى بعد المعالجة.")
     except DownloadError as exc:
         logger.info("Download rejected/failed: %s", exc)
-        await status.edit_text("❌ تعذر تنزيل الفيديو. تحقق من الرابط وإمكانية الوصول إليه.")
+        await status.edit_text("❌ تعذر تنزيل الملف. تحقق من الرابط وإمكانية الوصول إليه.")
     except TelegramError:
         logger.exception("Telegram send error")
         try:
-            await status.edit_text("⚠️ تعذر إرسال الملف عبر تيليجرام. حاول بفيديو أصغر.")
+            await status.edit_text("⚠️ تعذر إرسال الملف عبر تيليجرام. حاول بملف أصغر.")
         except TelegramError:
             pass
     except Exception:
@@ -179,8 +224,9 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(choose_media, pattern=r"^media:(video|audio)$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    logger.info("بدأ تشغيل البوت بنظام Polling")
+    logger.info("بدأ تشغيل بوت الفيديو والصوت بنظام Polling")
     app.run_polling(drop_pending_updates=True)
 
 
