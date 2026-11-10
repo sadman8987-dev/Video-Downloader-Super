@@ -1,4 +1,4 @@
-"""محرك التنزيل والضغط. ينظف مجلد العمل دائماً بعد إرسال الملف أو فشل العملية."""
+"""محرك تنزيل الفيديو والصوت MP3 مع تنظيف الملفات المؤقتة."""
 import asyncio
 import logging
 import subprocess
@@ -10,7 +10,6 @@ from typing import AsyncIterator
 
 logger = logging.getLogger(__name__)
 
-# نترك هامشاً أسفل سقف تيليجرام البالغ 50 MB.
 MAX_UPLOAD_BYTES = 48 * 1024 * 1024
 DOWNLOAD_TIMEOUT_SECONDS = 600
 FFMPEG_TIMEOUT_SECONDS = 300
@@ -41,35 +40,45 @@ def _looks_private(error: str) -> bool:
     return any(marker in text for marker in markers)
 
 
-def _find_video_file(folder: Path) -> Path:
+def _find_file(folder: Path, extensions: set[str]) -> Path:
     candidates = [
         p for p in folder.iterdir()
-        if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}
+        if p.is_file() and p.suffix.lower() in extensions
     ]
     if not candidates:
-        raise DownloadError("لم ينتج محرك التنزيل ملف فيديو")
+        raise DownloadError("لم ينتج محرك التنزيل ملفاً صالحاً")
     return max(candidates, key=lambda p: p.stat().st_size)
 
 
-async def _download_async(url: str, folder: Path) -> Path:
-    """تشغيل yt-dlp كعملية مستقلة يمكن إيقافها فعلياً عند انتهاء المهلة."""
+async def _run_ytdlp(url: str, folder: Path, mode: str) -> Path:
     output_template = str(folder / "source.%(ext)s")
     command = [
         sys.executable, "-m", "yt_dlp",
         "--output", output_template,
-        "--format", "bv*+ba/b",
-        "--merge-output-format", "mp4",
         "--no-playlist",
         "--socket-timeout", "30",
         "--retries", "2",
         "--fragment-retries", "2",
         "--file-access-retries", "2",
         "--extractor-retries", "2",
-        "--concurrent-fragments", "4",
         "--no-warnings",
         "--quiet",
-        url,
     ]
+    if mode == "audio":
+        command += [
+            "--format", "bestaudio/best",
+            "--extract-audio",
+            "--audio-format", "mp3",
+            "--audio-quality", "192K",
+        ]
+    else:
+        command += [
+            "--format", "bv*+ba/b",
+            "--merge-output-format", "mp4",
+            "--concurrent-fragments", "4",
+        ]
+    command.append(url)
+
     process = await asyncio.create_subprocess_exec(
         *command,
         stdout=asyncio.subprocess.PIPE,
@@ -77,8 +86,7 @@ async def _download_async(url: str, folder: Path) -> Path:
     )
     try:
         _, stderr = await asyncio.wait_for(
-            process.communicate(),
-            timeout=DOWNLOAD_TIMEOUT_SECONDS,
+            process.communicate(), timeout=DOWNLOAD_TIMEOUT_SECONDS
         )
     except asyncio.TimeoutError as exc:
         process.kill()
@@ -94,11 +102,14 @@ async def _download_async(url: str, folder: Path) -> Path:
             raise DownloadTimeoutError("انتهت مهلة الاتصال")
         raise DownloadError("فشل التنزيل")
 
-    return _find_video_file(folder)
+    extensions = {".mp3"} if mode == "audio" else {".mp4", ".mkv", ".webm", ".mov"}
+    result = _find_file(folder, extensions)
+    if result.stat().st_size > MAX_UPLOAD_BYTES:
+        raise FileTooLargeError("الملف أكبر من حد الإرسال المسموح")
+    return result
 
 
 def _compress_sync(source: Path, folder: Path) -> Path:
-    """ضغط تدريجي مع تقليل الدقة ومعدل البت حتى يصبح الملف أصغر من الحد."""
     output = folder / "compressed.mp4"
     attempts = [
         (720, "1100k", "128k"),
@@ -113,8 +124,7 @@ def _compress_sync(source: Path, folder: Path) -> Path:
             "-b:v", video_bitrate, "-maxrate", video_bitrate,
             "-bufsize", str(int(video_bitrate[:-1]) * 2) + "k",
             "-c:a", "aac", "-b:a", audio_bitrate,
-            "-movflags", "+faststart",
-            str(output),
+            "-movflags", "+faststart", str(output),
         ]
         try:
             result = subprocess.run(
@@ -126,25 +136,34 @@ def _compress_sync(source: Path, folder: Path) -> Path:
         if result.returncode == 0 and output.exists() and output.stat().st_size <= MAX_UPLOAD_BYTES:
             return output
         if result.returncode != 0:
-            logger.warning("FFmpeg compression attempt failed: %s", result.stderr[-1200:])
+            logger.warning("FFmpeg compression failed: %s", result.stderr[-1200:])
     raise FileTooLargeError("تعذر ضغط الفيديو إلى الحجم المطلوب")
 
 
 @asynccontextmanager
 async def download_video(url: str) -> AsyncIterator[Path]:
-    """
-    ينشئ مجلداً مؤقتاً، ينزّل الفيديو ويضغطه عند الحاجة.
-    يظل الملف متاحاً أثناء إرسال تيليجرام، ثم يُحذف المجلد دائماً.
-    """
+    """تنزيل الفيديو وضغطه عند الحاجة ثم تنظيف المجلد المؤقت."""
     temp_dir = tempfile.TemporaryDirectory(prefix="video_bot_")
     folder = Path(temp_dir.name)
     try:
-        source = await _download_async(url, folder)
+        source = await _run_ytdlp(url, folder, "video")
         if source.stat().st_size <= MAX_UPLOAD_BYTES:
             yield source
-            return
-        compressed = await asyncio.to_thread(_compress_sync, source, folder)
-        yield compressed
+        else:
+            yield await asyncio.to_thread(_compress_sync, source, folder)
     finally:
-        # التنظيف مضمون بعد الإرسال أو عند أي استثناء.
+        temp_dir.cleanup()
+
+
+@asynccontextmanager
+async def download_audio(url: str) -> AsyncIterator[Path]:
+    """استخراج الصوت وتحويله إلى MP3 بمعدل 192 kbps."""
+    temp_dir = tempfile.TemporaryDirectory(prefix="audio_bot_")
+    folder = Path(temp_dir.name)
+    try:
+        audio_file = await _run_ytdlp(url, folder, "audio")
+        if audio_file.stat().st_size > MAX_UPLOAD_BYTES:
+            raise FileTooLargeError("ملف MP3 أكبر من حد تيليجرام. جرّب مقطعاً أقصر.")
+        yield audio_file
+    finally:
         temp_dir.cleanup()
